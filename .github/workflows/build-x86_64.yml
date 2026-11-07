@@ -52,8 +52,18 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y mksh busybox-static
 
-      - name: Run the module regression tests
-        run: python3 -m unittest discover -s tests -q
+      # Mirrors upstream build.yml's "Build native host helper and run
+      # regression tests" step: the unittest fixtures shell out to a HOST
+      # asfetch at native/asfetch/target/debug/asfetch (tests/test_repair.py
+      # HOST), so it must be cargo-built before python3 -m unittest runs.
+      # Runners ship cargo preinstalled, same as upstream's job relies on.
+      - name: Build the native host helper and run the regression tests
+        run: |
+          set -euo pipefail
+          cargo build --locked --manifest-path native/asfetch/Cargo.toml
+          cargo test --locked --manifest-path native/asfetch/Cargo.toml
+          cargo test --locked --manifest-path native/watcher/Cargo.toml
+          python3 -m unittest discover -s tests -q
 
       - name: Rust toolchain (x86_64-linux-android)
         run: |
