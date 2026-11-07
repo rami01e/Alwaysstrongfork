@@ -9,6 +9,24 @@ esac
 [ -z "$MODPATH" ] && MODPATH="$PWD"
 cd "$MODPATH" 2>/dev/null
 
+# --- Action trace (always on) ---------------------------------------------
+# The manager shows only stdout and DISCARDS stderr, so every prelude failure
+# below (the busybox exec hop, a lock helper that cannot start, a function
+# check) used to leave the Action screen black with nothing to debug from —
+# the x86_64 port hit exactly that. Each prelude step appends one line here;
+# the file is truncated at the start of every tap and survives anything short
+# of the manager never running this script at all. Read it with:
+#   adb shell cat /data/adb/tricky_store/alwaysstrong/tmp/action.trace
+# (also included by collect_logs.sh, i.e. `action.sh logs`)
+AS_TRACE="${AS_CFG_ROOT:-/data/adb/tricky_store}/alwaysstrong/tmp/action.trace"
+as_trace() { printf '%s %s\n' "$(date '+%m-%d %H:%M:%S')" "$1" >>"$AS_TRACE" 2>/dev/null || :; }
+mkdir -p "${AS_TRACE%/*}" 2>/dev/null || :
+# Only the first (unlocked) process starts a fresh trace — the lock helper's
+# inner run and any unlocked fallback re-enter this file from the top and must
+# APPEND, or they would wipe the outer's hop / probe lines from the record.
+if [ "${AS_ACTION_LOCKED:-0}" != 1 ]; then : >"$AS_TRACE" 2>/dev/null || AS_TRACE=""; fi
+as_trace "start pid=$$ shell=$0 args=${*:-none} locked=${AS_ACTION_LOCKED:-0}"
+
 # Hop into the manager's busybox ash before doing anything else. Magisk used to
 # run action.sh inside its own ash, but newer Magisk Alpha builds (app 96221b69+)
 # start it with /system/bin/sh — mksh — and the `set +o standalone` below is a
@@ -19,17 +37,23 @@ cd "$MODPATH" 2>/dev/null
 # to bypass this hop there. Compare the current PID, which survives exec only.
 # With no busybox at all we stay put and only flip standalone if this shell
 # knows the option.
+as_trace "modpath=$MODPATH prop=$([ -f "$MODPATH/module.prop" ] && echo found || echo MISSING)"
 if [ "${AS_ASH:-}" != "$$" ]; then
     for bb in /data/adb/magisk/busybox /data/adb/ksu/bin/busybox /data/adb/ap/bin/busybox \
               /data/adb/modules/busybox-ndk/system/*/busybox; do
         if [ -x "$bb" ]; then
+            as_trace "hop: re-exec under $bb"
             export AS_ASH="$$"
             exec "$bb" sh "$MODPATH/action.sh" "$@"
         fi
     done
+    # The exec above never returns; reaching this line means no busybox exists.
+    # Stay in the manager's shell and let the subshell guard below decide.
+    as_trace "hop: no busybox found; staying in $(command -v sh 2>/dev/null || echo unknown-shell)"
 fi
 (set +o standalone) 2>/dev/null && set +o standalone
 unset ASH_STANDALONE
+as_trace "standalone: handled"
 
 # Boot auto-press sets AS_FAST=1: all the sleeps below are cosmetic progress
 # pacing for the WebUI/terminal, and nothing is watching the output at boot, so
@@ -54,17 +78,62 @@ if [ "$1" = "logs" ] && [ -x "$MODPATH/collect_logs.sh" ]; then
 fi
 
 CONFIG_DIR=${AS_CFG_ROOT:-/data/adb/tricky_store}
-# Our own settings/state/logs (one directory, see as_store.sh).
-[ -f "$MODPATH/as_store.sh" ] && . "$MODPATH/as_store.sh" && as_init
+# Our own settings/state/logs (one directory, see as_store.sh). A missing or
+# unloadable store must be LOUD: downstream as_lock_run / st_set would
+# otherwise fail as `function not found` (rc=127) and blank the screen.
+if [ -f "$MODPATH/as_store.sh" ]; then
+    . "$MODPATH/as_store.sh" && as_init || {
+        echo "  ❗ as_store.sh did not load — broken install, reflash the module"
+        as_trace "fatal: as_store.sh source/init failed"
+        exit 1
+    }
+    as_trace "store: ok (runtime=$AS_RUNTIME_DIR tool=${AS_NATIVE_TOOL:-unset})"
+else
+    echo "  ❗ as_store.sh missing — broken install, reflash the module"
+    as_trace "fatal: as_store.sh missing at $MODPATH"
+    exit 1
+fi
 # Share one lock across manager taps, WebUI, reset and the boot auto-action.
 # The inherited native descriptor remains held by the actual worker.
 if [ "${AS_ACTION_LOCKED:-0}" != 1 ]; then
     export AS_ACTION_LOCKED=1
+    # x86_64: prove the helper binary starts on this arch BEFORE betting the
+    # whole Action on it (0/75 = it ran; 126/127/other = wrong arch, blocked
+    # exec, stale install). A dead helper used to exit here in silence — the
+    # black Action screen.
+    probe_rc=0
+    [ -x "$AS_NATIVE_TOOL" ] && "$AS_NATIVE_TOOL" lock-run "$AS_TMP/action.probe.flock" 0 true >/dev/null 2>&1 || probe_rc=$?
+    case "$probe_rc" in
+        0|75) as_trace "lock: helper ok (probe rc=$probe_rc)" ;;
+        *)    as_trace "lock: helper probe FAILED rc=$probe_rc tool=${AS_NATIVE_TOOL:-unset}"
+              echo "  ⚠️  native lock helper cannot run (rc=$probe_rc)"
+              echo "  ⚠️  ${AS_NATIVE_TOOL:-helper path unknown}"
+              echo "  ⚠️  running unlocked — include the trace log in the report" ;;
+    esac
     rc=0
-    as_lock_run "$AS_TMP/action.flock" 0 sh "$MODPATH/action.sh" "$@" || rc=$?
+    if [ "$probe_rc" = 0 ] || [ "$probe_rc" = 75 ]; then
+        rm -f "$AS_TMP/action.started" 2>/dev/null
+        as_lock_run "$AS_TMP/action.flock" 0 sh "$MODPATH/action.sh" "$@" || rc=$?
+        # rc is the inner script's verdict (0 ok / 1 errors / 2 warnings) — but
+        # the SAME code when lock-run itself fails before the inner starts. The
+        # stamp the inner writes below tells the two apart: no stamp = no inner
+        # run = a silent black screen otherwise, so retry unlocked and say why.
+        if [ "$rc" != 0 ] && [ "$rc" != 2 ] && [ "$rc" != 75 ] \
+           && [ ! -f "$AS_TMP/action.started" ]; then
+            as_trace "lock: lock-run rc=$rc but inner never started — retrying unlocked"
+            echo "  ⚠️  action lock failed (rc=$rc); running unlocked"
+            sh "$MODPATH/action.sh" "$@" || rc=$?
+        fi
+    else
+        sh "$MODPATH/action.sh" "$@" || rc=$?
+    fi
     [ "$rc" != 75 ] || echo "Action is already running; try again after it finishes."
     exit "$rc"
 fi
+# Inner (locked) run only from here. Stamp immediately so the outer can tell
+# a real run from a lock-run failure, and keep the trace going.
+as_trace "inner: locked run starting (pid $$)"
+: >"$AS_TMP/action.started" 2>/dev/null || :
 : "${AS_LOGS:=/data/adb/tricky_store/alwaysstrong/logs}"
 mkdir -p "$AS_LOGS" 2>/dev/null
 LINE="========================="
@@ -126,8 +195,11 @@ bounded() { _bs="$1"; shift; if [ -n "$TO" ]; then $TO "$_bs" "$@"; else "$@"; f
 # identical in both.
 if [ -f "$MODPATH/engine.sh" ]; then
     . "$MODPATH/engine.sh"
+    as_trace "engine: ${ENGINE:-unknown} loaded"
 else
-    echo "  engine.sh missing — broken install, reflash the module"; exit 1
+    echo "  engine.sh missing — broken install, reflash the module"
+    as_trace "fatal: engine.sh missing at $MODPATH"
+    exit 1
 fi
 
 # asfetch first (connects IPv4-first, works on IPv6-only-DNS networks); fall
@@ -150,12 +222,16 @@ dl_to() {
 # --- Header ---
 # Refuse to run a partly parsed/broken script instead of returning success
 # after repeated "function: inaccessible or not found" diagnostics.
+# The manager discards stderr, so this report goes to stdout: an invisible
+# error was the other half of the x86_64 black Action screen.
 for _required in row action_error action_warning bounded as_on st_get st_set engine_enforce_spoof; do
     command -v "$_required" >/dev/null 2>&1 || {
-        printf 'Action: required function %s is unavailable\n' "$_required" >&2
+        printf 'Action: required function %s is unavailable\n' "$_required"
+        as_trace "fatal: required function $_required unavailable"
         exit 1
     }
 done
+as_trace "required functions ok (engine=${ENGINE:-unset})"
 echo ""
 echo "  $LINE"
 row "🔒" "AlwaysStrong  ${VER}"
@@ -418,6 +494,7 @@ row "👤" "@SUKISU_ULTR4"
 echo "  $LINE"
 echo ""
 
+as_trace "done rc=$ACTION_RC errors=$ACTION_ERRORS warnings=$ACTION_WARNINGS"
 if { [ "$KSU" = "true" ] || [ "$APATCH" = "true" ]; } \
    && [ "$KSU_NEXT" != "true" ] && [ "$WKSU" != "true" ] && [ "$MMRL" != "true" ]; then
     sleep 2

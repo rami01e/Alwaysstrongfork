@@ -51,7 +51,7 @@ this folder; `changes.diff` shows the exact lines.
 | `build.sh` | 1 line | `ASFETCH_ABIS=(arm64-v8a armeabi-v7a ${ASFETCH_ABIS_EXTRA:-})` — stages an x86_64 asfetch only when the x86_64 workflow asks for it; stock arm behavior untouched |
 | `module/repair_runtime.sh` | 2 lines | `x86_64` / `i?86` branches in the `uname -m` case |
 | `module/verdict_report.sh` | 2 lines | `x86_64` / `i?86` branches, plus a graceful "no native parser" exit instead of a crash when the parser is absent |
-| `scripts/check-x86_64-install.sh` | **new** (optional) | Simulates `customize.sh`'s install-time gates against a built zip |
+| `scripts/check-x86_64-install.sh` | **new** (optional) | Simulates `customize.sh`'s install-time gates against a built zip, plus a CRLF byte-check of every shipped script |
 
 Nothing else is touched: no `customize.sh` change is needed because the x86_64
 zip ships its own `bin/x86_64/asfetch`, so the existing install gate passes as
@@ -141,3 +141,91 @@ missing, and `repair_runtime.sh` refuses every locked settings write without
 it. Shipping the 1.2 MB binary is what turns "installs and half-degrades"
 into "installs and fully works" — while stock arm builds keep their current
 contents byte-for-byte.
+
+## 7. Debugging a blank Action screen (action.sh)
+
+The manager shows only an action script's stdout and **discards stderr**, so
+any prelude failure used to leave the Action screen black with nothing to go
+on — that is exactly what an x86_64 install hit. `action.sh` now has three
+layers against it:
+
+1. **Trace file (always on).** Every prelude step appends a timestamped line
+   to `/data/adb/tricky_store/alwaysstrong/tmp/action.trace`. The file is
+   truncated at the start of each tap (by the first, unlocked process only —
+   the lock helper's inner run and any fallback append) and survives a shell
+   dying mid-way. Read it with:
+   `adb shell cat /data/adb/tricky_store/alwaysstrong/tmp/action.trace`
+   or tap `action.sh logs` — `collect_logs.sh` includes the trace as
+   `--- action.trace (prelude debug ...)`.
+2. **No silent exits.** `as_store.sh` missing/unloadable and the
+   required-function check now print to **stdout** (the visible channel) and
+   exit non-zero.
+3. **Lock helper preflight + unlocked fallback.** Before the action is handed
+   to `asfetch lock-run`, a probe runs `asfetch lock-run <probe.flock> 0 true`
+   and checks the exit code. Anything other than 0/75 (wrong-arch ELF, blocked
+   exec, stale install — rc 126/127 style) prints three warning rows and runs
+   the action **unlocked** instead of exiting silently. The same fallback
+   covers a lock-run that fails after the probe (the inner run writes an
+   `action.started` stamp; no stamp + non-zero rc = retry unlocked).
+
+On a healthy device the visible Action output is byte-identical to upstream;
+the trace file is the only addition.
+
+CI note: the required-function error moved from stderr to stdout, so
+`tests/test_action_shell.py` asserts `result.stdout` now — apply the updated
+test together with the updated `action.sh`, or the unittest step fails.
+
+### 7.1 The one failure no script can self-diagnose: CRLF line endings
+
+Every failure above happens *inside* the running script, so the trace and
+stdout rows can report it. One failure happens **before any code runs**: if
+`action.sh` carries Windows CRLF (`\r\n`) line endings, the shell dies at
+parse time and even line 2 never executes — no output, no trace file, black
+Action screen. The manager log (KernelSU app) shows the fingerprint:
+
+```
+/data/adb/modules/tricky_store/action.sh: line 4:
+: not found
+/data/adb/modules/tricky_store/action.sh: line 5: syntax error: unexpected word (expecting "in")
+```
+
+Line 4 of `action.sh` is a blank line — with CRLF it becomes a lone `\r`,
+which the shell tries to *execute* as a command name (invisible, hence the
+empty `: not found`). Line 5 is `case "$0" in` — with CRLF the keyword
+becomes `in\r`, which ash no longer recognizes, hence `expecting "in"`.
+Any two errors of that shape (`: not found` on a blank line + `unexpected
+word (expecting "in")` on a `case`/`for` line) are CRLF, regardless of the
+exact line numbers.
+
+The repo, CI builds and shipped zips are LF-clean (`.gitattributes` forces
+LF checkouts, `build.sh` step 6 strips CR at staging,
+`check-x86_64-install.sh` byte-checks the zip). This failure therefore comes
+from **editing scripts on the device** with an editor or clipboard round-trip
+that saves CRLF.
+
+Fix in place (root shell, no reflash needed):
+
+```sh
+cd /data/adb/modules/tricky_store
+cp action.sh action.sh.bak
+sed -i 's/\r$//' action.sh          # strip CR from every line
+tr -cd '\r' < action.sh | wc -c     # must print 0
+/data/adb/ksu/bin/busybox sh -n action.sh && echo SYNTAX_OK
+```
+
+Then tap Action again. To confirm the diagnosis before fixing:
+`od -c action.sh | head` — CRLF shows as `\r  \n` pairs; a clean file shows
+only `\n`. The same fix applies to any module script (`service.sh`, …).
+
+Prevention when hand-tuning on device:
+
+- Prefer `adb push` of a repo file over on-device editing — the repo is
+  LF-enforced, the device is not.
+- Pasting through a root shell heredoc (`cat > action.sh <<'EOF' … EOF`) is
+  safe: an interactive terminal translates CR to NL on input.
+- Editors like MT Manager preserve a file's existing endings; Windows
+  editors (Notepad, some IDE defaults) do not — never round-trip module
+  scripts through one.
+- For a durable fix, commit the updated `module/action.sh` from this folder
+  and rebuild: the always-on trace (`…/alwaysstrong/tmp/action.trace`) then
+  covers every future prelude failure without hand edits.

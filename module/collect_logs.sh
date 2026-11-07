@@ -341,6 +341,7 @@ echo "--- action-boot.log (first-boot Action)"; tail_or action-boot.log "$AS_LOG
 echo "--- action-reset.log (Reset to defaults)"; tail_or action-reset.log "$AS_LOGS/action-reset.log" 40
 echo "--- action-webui.log (WebUI Action)"; tail_or action-webui.log "$AS_LOGS/action-webui.log" 100
 echo "--- action-webui.status"; tail_or action-webui.status "$AS_LOGS/action-webui.status" 5
+echo "--- action.trace (prelude debug: hop / store / lock helper)"; tail_or action.trace "$AS_TMP/action.trace" 40
 echo "--- module.log"; tail_or module.log "$MODDIR/logs/module.log" 60
 
 sec "SELinux denials / crashes around keystore"
