@@ -49,9 +49,11 @@ this folder; `changes.diff` shows the exact lines.
 | `.github/workflows/build-x86_64.yml` | **new** | Separate workflow: syntax check → host asfetch build + cargo tests + module test suite (same as upstream `build.yml` runs before unittest) → build x86_64 asfetch → build `inject` + `fork` with `--build-tag x86_64` → `verify-module-zip.py` → per-zip ABI report → artifact upload |
 | `scripts/build-asfetch-x86_64.sh` | **new** | Cross-compiles asfetch for `x86_64-linux-android` (API 29) into `native/asfetch/prebuilt/x86_64/`. Direct cargo + NDK clang (no cargo-ndk), same RUSTFLAGS path-hygiene as `build-asfetch.sh` |
 | `build.sh` | 1 line | `ASFETCH_ABIS=(arm64-v8a armeabi-v7a ${ASFETCH_ABIS_EXTRA:-})` — stages an x86_64 asfetch only when the x86_64 workflow asks for it; stock arm behavior untouched |
-| `module/repair_runtime.sh` | 2 lines | `x86_64` / `i?86` branches in the `uname -m` case |
+| `module/repair_runtime.sh` | 8 lines | `x86_64` / `i?86` branches in the `uname -m` case, plus an executable-probe fallback: when the mapped helper is missing, it re-picks whichever `bin/<abi>/asfetch` the install actually shipped — a stale mapping can no longer leave settings writes dead |
 | `module/verdict_report.sh` | 2 lines | `x86_64` / `i?86` branches, plus a graceful "no native parser" exit instead of a crash when the parser is absent |
+| `module/pif_native_fetch.sh` | 12 lines | POSIX-safe fetcher guard (the old `[ -z "$ABI" -o ! -x … ]` mis-parses under some test builtins and silently skips), an ABI probe that adopts any other shipped helper when the mapped one is missing, and a self-documenting failure line (`abi=… path=…`) so one trace pins the device state |
 | `scripts/check-x86_64-install.sh` | **new** (optional) | Simulates `customize.sh`'s install-time gates against a built zip, plus a CRLF byte-check of every shipped script |
+| `tests/test_action_shell.py` | **required with action.sh** | The required-function assertion moved from stderr to stdout (the manager discards stderr). Commit it together with the updated `module/action.sh` or the unittest CI step fails |
 
 Nothing else is touched: no `customize.sh` change is needed because the x86_64
 zip ships its own `bin/x86_64/asfetch`, so the existing install gate passes as
@@ -229,3 +231,49 @@ Prevention when hand-tuning on device:
 - For a durable fix, commit the updated `module/action.sh` from this folder
   and rebuild: the always-on trace (`…/alwaysstrong/tmp/action.trace`) then
   covers every future prelude failure without hand edits.
+
+### 7.2 Runtime picked `bin/arm64-v8a/asfetch` on an x86_64 device
+
+Trace fingerprint (seen in the wild):
+
+```
+store: ok (runtime=/data/adb/modules/tricky_store tool=…/bin/arm64-v8a/asfetch)
+lock: helper probe FAILED rc=1 tool=…/bin/arm64-v8a/asfetch
+```
+
+plus the visible rows `target list refresh failed` / `keybox fetch failed`.
+The module resolved its native lock helper to the **arm64** binary: on a
+foreign-arch device that binary either cannot exec (rc 126/127) or only
+half-runs under an ARM-translation layer (rc 1) — and every locked settings
+write (`as_lock_run` in `repair_runtime.sh`) and every `run-bounded` call
+dies with it. `pif_native_fetch.sh` may also report "no certificate-validating
+fetcher available (asfetch/curl)" in the same state.
+
+Cause: the installed `module/repair_runtime.sh` predates the x86_64 port — a
+stale zip, a partially applied commit set, or a hand edit. The install itself
+is fine (`customize.sh` aborts unless `bin/x86_64/asfetch` installs **and**
+passes its `lock-run`/`run-bounded` runtime check, so a successful install
+proves the native helper works).
+
+The same tap's `autopif.log` line `pif_native_fetch: no certificate-validating
+fetcher available` had a second contributor: that script's guard was written
+as `[ -z "$ABI" -o ! -x "$ASFETCH" ]`, which some `test` builtins mis-parse,
+and it named no path. It is now split POSIX-safe, adopts any other shipped
+ABI's helper, and prints `abi=… path=…` when it does give up.
+
+Fix: commit the updated `module/repair_runtime.sh` and
+`module/pif_native_fetch.sh` from this folder and rebuild. The tool resolution
+is now `uname -m`-mapped **with an executable-probe fallback** — if the mapped
+path is not executable it re-picks whichever `bin/<abi>/asfetch` the install
+really shipped — so a stale mapping can no longer leave the module write-dead.
+After the rebuild the trace should read `tool=…/bin/x86_64/asfetch` and
+`lock: helper ok (probe rc=0)`.
+
+Unrelated on x86_64 but seen in the same log: a `keybox fetch failed` /
+"server unreachable" row with `checking keybox...` reached means the ABI
+chain worked and the keybox mirror itself was unreachable from that network
+(the fingerprint fallback ran over busybox wget). The mirror was verified up
+(HTTPS 200) from an outside host at the time of writing. Test from the device
+root shell with `sh /data/adb/modules/tricky_store/keybox_fetch.sh; echo rc=$?`
+and `nslookup evoker.qzz.io` — an emulator NAT/DNS/IPv6 quirk is the usual
+culprit, not the module.

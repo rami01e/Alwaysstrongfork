@@ -58,8 +58,22 @@ for p in /data/adb/modules/busybox-ndk/system/*/busybox /data/adb/magisk/busybox
     [ -f "$p" ] && BB="$p" && break
 done
 
-if [ -z "$ABI" -o ! -x "$ASFETCH" ] && ! command -v curl >/dev/null 2>&1; then
-    log "no certificate-validating fetcher available (asfetch/curl)."; exit 1
+# Mapped helper missing (stale install, partial unzip, hand edit)? Take any
+# other ABI's helper the module dir really ships before giving up — the x86_64
+# port hit exactly this state ("no certificate-validating fetcher" while the
+# arm64 helper sat next to an empty bin/x86_64). The old single-line guard
+# `[ -z "$ABI" -o ! -x "$ASFETCH" ]` also mis-parses under some test builtins
+# (dash silently skipped it), so both checks are split POSIX-safe now.
+if [ -n "$ABI" ] && [ ! -x "$ASFETCH" ]; then
+    for _ab in x86_64 arm64-v8a armeabi-v7a x86; do
+        [ -x "$SELF_DIR/bin/$_ab/asfetch" ] || continue
+        ASFETCH="$SELF_DIR/bin/$_ab/asfetch"; ABI="$_ab"; break
+    done
+    unset _ab
+fi
+if { [ -z "$ABI" ] || [ ! -x "$ASFETCH" ]; } && ! command -v curl >/dev/null 2>&1; then
+    log "no certificate-validating fetcher available (abi=${ABI:-none} path=$ASFETCH)."
+    exit 1
 fi
 
 # bounded SECS cmd... — run cmd under a hard wall-clock cap. A fetcher that

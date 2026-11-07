@@ -17,6 +17,7 @@ unset _as_bb
 # The bundled helper uses flock(2), so a crashed writer releases its lock
 # without PID reuse, stale-directory deletion or a BusyBox flock dependency.
 if [ -z "${AS_NATIVE_TOOL:-}" ]; then
+    _as_dir="${AS_RUNTIME_DIR:-${MODPATH:-${V_DIR:-${0%/*}}}}"
     case "$(uname -m)" in
         aarch64) _as_abi=arm64-v8a ;;
         armv7*|armv8l) _as_abi=armeabi-v7a ;;
@@ -24,8 +25,20 @@ if [ -z "${AS_NATIVE_TOOL:-}" ]; then
         i?86) _as_abi=x86 ;;
         *) _as_abi=unsupported ;;
     esac
-    AS_NATIVE_TOOL="${AS_RUNTIME_DIR:-${MODPATH:-${V_DIR:-${0%/*}}}}/bin/$_as_abi/asfetch"
-    unset _as_abi
+    AS_NATIVE_TOOL="$_as_dir/bin/$_as_abi/asfetch"
+    # Stale installs, hand edits and ARM-translation layers can leave the
+    # mapped helper missing (or mapped to a foreign arch that only half-runs,
+    # which the x86_64 port hit as lock helper probe rc=1). When the mapped
+    # path is not executable, take whichever native helper the install really
+    # shipped instead of pointing every settings write at a dead path.
+    [ -x "$AS_NATIVE_TOOL" ] || {
+        for _as_abi in x86_64 arm64-v8a armeabi-v7a x86; do
+            [ -x "$_as_dir/bin/$_as_abi/asfetch" ] || continue
+            AS_NATIVE_TOOL="$_as_dir/bin/$_as_abi/asfetch"
+            break
+        done
+    }
+    unset _as_abi _as_dir
 fi
 as_lock_run() {
     [ -x "$AS_NATIVE_TOOL" ] || { echo 'repair: native lock helper unavailable; write refused' >&2; return 1; }

@@ -118,7 +118,9 @@ engine_autopif() { return 1; }
         self.script('engine.sh', 'ENGINE=fork\n')
         result = self.run_action()
         self.assertEqual(result.returncode, 1)
-        self.assertIn('required function engine_enforce_spoof is unavailable', result.stderr)
+        # The manager discards stderr, so the report goes to stdout — that is
+        # the whole point: an invisible failure was the black Action screen.
+        self.assertIn('required function engine_enforce_spoof is unavailable', result.stdout)
         self.assertNotIn('✅', result.stdout)
 
 
