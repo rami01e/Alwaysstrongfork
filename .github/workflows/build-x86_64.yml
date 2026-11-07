@@ -80,7 +80,15 @@ jobs:
       - name: Build the x86_64 fetcher (asfetch)
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
-        run: bash scripts/build-asfetch-x86_64.sh
+        run: |
+          set -euo pipefail
+          # Guard against a stale copy: the ARM scripts/build-asfetch.sh needs
+          # cargo-ndk and dies on the runner ("cargo-ndk not installed"). The
+          # x86_64 variant must call cargo directly with the NDK clang wrapper.
+          grep -qF 'cargo build --locked --release --target "$TARGET"' \
+            scripts/build-asfetch-x86_64.sh \
+            || { echo 'scripts/build-asfetch-x86_64.sh is not the x86_64 variant (looks like the ARM build-asfetch.sh) — re-copy it from the x86_64 delivery' >&2; exit 1; }
+          bash scripts/build-asfetch-x86_64.sh
 
       - name: Build the inject + fork lines for x86_64
         env:
