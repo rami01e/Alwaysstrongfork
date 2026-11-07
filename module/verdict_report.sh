@@ -18,8 +18,11 @@ if [ "${1:-}" = __publish ]; then
   mv -f "$incoming" "$AS_DIR/verdict"
   exit 0
 fi
-case "$(uname -m)" in aarch64) abi=arm64-v8a ;; armv7*|armv8l) abi=armeabi-v7a ;; *) abi=unsupported ;; esac
+case "$(uname -m)" in aarch64) abi=arm64-v8a ;; armv7*|armv8l) abi=armeabi-v7a ;; x86_64) abi=x86_64 ;; i?86) abi=x86 ;; *) abi=unsupported ;; esac
 fetch=${AS_VERDICT_PARSER:-$MODPATH/bin/$abi/asfetch}
+# x86 builds ship no asfetch (see build.sh ASFETCH_ABIS): say so instead of
+# failing with a bare "not found" under set -eu.
+[ -x "$fetch" ] || { echo "verdict: no native parser for $abi — report skipped"; exit 0; }
 file=${1:-$AS_DIR/verdict-inbox.json}
 [ -s "$file" ] || exit 1
 work=$(mktemp -d "$AS_TMP/verdict.XXXXXX")

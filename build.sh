@@ -410,7 +410,11 @@ ASFETCH_PREBUILT="$ASFETCH_SRC_DIR/prebuilt"
 # arm only — asfetch matters on real devices (no curl, busybox TLS stalls).
 # x86/x86_64 are emulator-only; there curl/busybox already work, and shipping
 # rustls for them would add ~1.9 MB to the zip for no real-device benefit.
-ASFETCH_ABIS=(arm64-v8a armeabi-v7a)
+# The x86_64 build line (.github/workflows/build-x86_64.yml) exports
+# ASFETCH_ABIS_EXTRA=x86_64 after running scripts/build-asfetch-x86_64.sh:
+# customize.sh aborts when bin/$ABI_DIR/asfetch is missing, and repair_runtime's
+# lock helpers need it for every settings write, so that line ships its own.
+ASFETCH_ABIS=(arm64-v8a armeabi-v7a ${ASFETCH_ABIS_EXTRA:-})
 
 asfetch_needs_build() {
     [[ -d "$ASFETCH_SRC_DIR" ]] || return 1

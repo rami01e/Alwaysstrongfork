@@ -20,6 +20,8 @@ if [ -z "${AS_NATIVE_TOOL:-}" ]; then
     case "$(uname -m)" in
         aarch64) _as_abi=arm64-v8a ;;
         armv7*|armv8l) _as_abi=armeabi-v7a ;;
+        x86_64) _as_abi=x86_64 ;;
+        i?86) _as_abi=x86 ;;
         *) _as_abi=unsupported ;;
     esac
     AS_NATIVE_TOOL="${AS_RUNTIME_DIR:-${MODPATH:-${V_DIR:-${0%/*}}}}/bin/$_as_abi/asfetch"

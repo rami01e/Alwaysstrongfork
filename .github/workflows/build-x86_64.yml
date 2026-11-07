@@ -1,0 +1,131 @@
+name: Build x86_64
+
+# x86_64 Android build line (emulators, Chromebooks, x86_64 phones).
+#
+# Deliberately SEPARATE from .github/workflows/build.yml so syncing this fork
+# with upstream never conflicts: everything here is additive. Only three tiny
+# in-file hooks are required and all are upstream-safe:
+#   1. scripts/build-asfetch-x86_64.sh  (new file)   builds bin/x86_64/asfetch
+#   2. build.sh ASFETCH_ABIS_EXTRA env  (1 line)     stages that binary
+#   3. module/repair_runtime.sh + verdict_report.sh x86_64 case branches
+#
+# What upstream already provides for x86_64 (verified against the pinned
+# releases): TEESimulator-RS ships lib/x86_64/*, PlayIntegrityFix inject-s
+# ships zygisk/x86_64.so, and native/watcher ships a committed x86_64 aswatcher.
+#
+# Known upstream limitation: the pinned osm0sis/PlayIntegrityFork CI build only
+# publishes arm zygisk libraries, so the fork line's zip carries NO working PIF
+# spoof on x86_64 — the TEESimulator-RS attestation, keybox fetcher and repair
+# runtime all work, the fingerprint spoof does not. For a full x86_64 module
+# use the -inject build. This job reports the zygisk ABIs of every zip it
+# builds so the limitation is visible in the run summary.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-x86_64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax-check the files this line touches
+        run: |
+          set -euo pipefail
+          bash -n build.sh
+          bash -n scripts/build-asfetch-x86_64.sh
+          bash -n module/customize.sh module/repair_runtime.sh module/verdict_report.sh
+
+      - name: Install Android shell compatibility test tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y mksh busybox-static
+
+      - name: Run the module regression tests
+        run: python3 -m unittest discover -s tests -q
+
+      - name: Rust toolchain (x86_64-linux-android)
+        run: |
+          rustup update stable
+          rustup target add x86_64-linux-android
+
+      - name: Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          add-to-path: false
+
+      - name: Build the x86_64 fetcher (asfetch)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: bash scripts/build-asfetch-x86_64.sh
+
+      - name: Build the inject + fork lines for x86_64
+        env:
+          ASFETCH_ABIS_EXTRA: x86_64
+        run: |
+          set -euo pipefail
+          # Ship the freshly built x86_64 asfetch (and the committed watcher
+          # prebuilts) instead of asking build.sh to recompile every ABI.
+          find native -path '*/prebuilt/*' -type f -exec touch {} +
+          bash build.sh --variant inject --build-tag x86_64
+          bash build.sh --variant fork   --build-tag x86_64
+
+      - name: Validate the built ZIPs
+        run: |
+          set -euo pipefail
+          python3 scripts/verify-module-zip.py out/AlwaysStrong-*x86_64*.zip
+          (cd out && sha256sum AlwaysStrong-*x86_64*.zip > SHA256SUMS-x86_64.txt)
+          cat out/SHA256SUMS-x86_64.txt
+
+      - name: Report per-zip ABI coverage
+        run: |
+          set -euo pipefail
+          {
+            echo '### x86_64 build ABI coverage'
+            echo
+            for z in out/AlwaysStrong-*x86_64*.zip; do
+              echo "**$(basename "$z")**"
+              echo '```'
+              zygisk=$(unzip -l "$z" | grep -oE 'zygisk/[a-z0-9_-]+\.so' | sort -u || true)
+              if [ -n "$zygisk" ]; then
+                echo "$zygisk"
+                if unzip -l "$z" | grep -q 'zygisk/x86_64.so'; then
+                  echo '-> PIF spoof: WORKS on x86_64'
+                else
+                  echo '-> PIF spoof: arm-only upstream, NOT functional on x86_64'
+                  echo '   (TEESimulator-RS attestation + keybox stack DO work)'
+                fi
+              else
+                echo 'no zygisk payload'
+              fi
+              unzip -l "$z" | grep -oE 'bin/x86_64/(asfetch|aswatcher)' | sort -u || true
+              unzip -l "$z" | grep -oE 'lib/x86_64/[^ ]+' | sort -u || true
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload x86_64 module ZIPs
+        uses: actions/upload-artifact@v4
+        with:
+          # Distinct from build.yml's "AlwaysStrongFork-module-zip" so the
+          # release workflow keeps consuming exactly the four ARM zips.
+          name: AlwaysStrongFork-module-zip-x86_64
+          path: |
+            out/AlwaysStrong-*x86_64*.zip
+            out/SHA256SUMS-x86_64.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
